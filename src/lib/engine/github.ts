@@ -22,7 +22,11 @@ interface GitHubCommit {
 }
 
 const PER_PAGE = 100;
-const MAX_PAGES = 6; // up to 600 commits in the window; plenty for a Wrapped
+// Paginate the whole window. `since` already bounds results to the last 12
+// months, so pagination terminates naturally for a normal repo; this ceiling
+// only guards against a pathological, tens-of-thousands-of-commits repo hanging
+// the Worker. Effectively uncapped for real repositories.
+const MAX_PAGES = 200; // up to 20,000 commits in the window
 
 export interface GitHubReadResult {
   commits: RawCommit[];
@@ -62,6 +66,9 @@ export async function readGitHubCommits(
       // Distinguish rate limiting from a genuinely private/forbidden repo.
       const remaining = res.headers.get("x-ratelimit-remaining");
       if (remaining === "0") {
+        // If we already have commits, return the partial window rather than
+        // failing the whole wrap. Only error if we got nothing at all.
+        if (commits.length > 0) break;
         throw softError("timeout", "GitHub is rate limiting us right now. Try again in a minute.");
       }
       throw softError("private", "That repo looks private. Repo Wrapped only reads public repos.");

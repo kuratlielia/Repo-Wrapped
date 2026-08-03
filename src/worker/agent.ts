@@ -61,7 +61,7 @@ const GIT_IDENTITY = { name: "Repo Wrapped", email: "bot@repo-wrapped.dev" } as 
  * of history and filter to the window in JS. This also caps clone CPU inside the
  * isolate. 12 months of a busy repo comfortably fits.
  */
-const HISTORY_DEPTH = 2500;
+const HISTORY_DEPTH = 25000;
 
 // ---------------------------------------------------------------------------
 // DO input / RPC surface
