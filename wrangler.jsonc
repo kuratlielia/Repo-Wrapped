@@ -1,0 +1,89 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "repo-wrapped",
+	// Custom Worker entry: re-exports OpenNext's handler plus our Durable Objects
+	// (Agent, LeaderboardDO). Built by `opennextjs-cloudflare build`, then bundled
+	// by `wrangler deploy`. See DEPLOY.md.
+	"main": "src/worker/index.ts",
+	"compatibility_date": "2026-04-15",
+	// - nodejs_compat: required by @opennextjs/cloudflare AND @cloudflare/computer.
+	// - global_fetch_strictly_public: recommended by OpenNext for correct caching.
+	// The DO reads history with the in-isolate isomorphic-git client, so no
+	// Worker Loader / experimental flag is needed.
+	"compatibility_flags": [
+		"nodejs_compat",
+		"global_fetch_strictly_public"
+	],
+	"observability": {
+		"enabled": true
+	},
+
+	// Static assets produced by the Next.js/OpenNext build.
+	"assets": {
+		"directory": ".open-next/assets",
+		"binding": "ASSETS"
+	},
+
+	// The archaeology agent: one Durable Object per repo slug, owning a
+	// @cloudflare/computer Workspace attached to its own SQLite storage.
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "Agent",
+				"class_name": "Agent"
+			},
+			// The public leaderboard: a single global SQLite-backed DO instance.
+			{
+				"name": "LEADERBOARD",
+				"class_name": "LeaderboardDO"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["Agent"]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["LeaderboardDO"]
+		}
+	],
+
+	// Workers AI: the single batched caption call runs here, through AI Gateway.
+	"ai": {
+		"binding": "AI"
+	},
+
+	"vars": {
+		// Small, cheap caption model. Overridable; keep in sync with @/lib/captions.
+		"WRAP_MODEL": "@cf/meta/llama-3.2-3b-instruct",
+		// AI Gateway id — create a gateway with this name (see DEPLOY.md).
+		"CF_AI_GATEWAY": "repo-wrapped"
+		// CF_ACCOUNT_ID + a CF_API_TOKEN secret are ONLY needed for the local-dev
+		// REST caption fallback in @/lib/captions; in production the AI binding is
+		// used in-worker, so no secret is required for captions.
+	},
+
+	// --- OpenNext plumbing ---------------------------------------------------
+	// Self-reference service binding; `service` must match `name` above.
+	// See https://opennext.js.org/cloudflare/caching
+	"services": [
+		{
+			"binding": "WORKER_SELF_REFERENCE",
+			"service": "repo-wrapped"
+		}
+	],
+	// R2-backed incremental cache. Create the bucket before deploying (DEPLOY.md),
+	// or delete this block to deploy without OpenNext incremental caching.
+	"r2_buckets": [
+		{
+			"binding": "NEXT_INC_CACHE_R2_BUCKET",
+			"bucket_name": "repo-wrapped-opennext-cache"
+		}
+	],
+	// Next.js image optimization.
+	"images": {
+		"binding": "IMAGES"
+	}
+}
