@@ -1,138 +1,70 @@
 # Deploying Repo Wrapped to Cloudflare
 
-Repo Wrapped runs as a Next.js app on **Cloudflare Workers** via
+Repo Wrapped runs as a Next.js 16 app on **Cloudflare Workers** via
 [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). The git
 archaeology runs inside a **Durable Object** (`Agent`) that owns a
 [`@cloudflare/computer`](https://www.npmjs.com/package/@cloudflare/computer)
 Workspace attached to the DO's SQLite storage.
 
-On a normal **public** repo the whole pipeline runs **in isolates** — the DO
-clones the repo with the isomorphic-git client and runs `git log` through the
-worker-shell backend's built-in `git` command. **Zero containers are invoked.**
-That is the cost story: a Wrapped costs a fast clone, an isolate `exec`, and
-**one** batched Workers AI call.
+On a public repo the DO clones with the in-isolate isomorphic-git client and
+reads `git log` entirely in an isolate. **Zero containers.** If the in-isolate
+clone cannot complete, it falls back to the GitHub REST API (still isolate-only,
+a few HTTPS calls). Captions are **one** batched Workers AI call.
 
----
+Live: <https://repo-wrapped.eliaroankuratli.workers.dev>
 
-## Prerequisites
+## Bindings (wrangler.jsonc)
 
-- `wrangler` v4 authenticated: `npx wrangler login` (or `CLOUDFLARE_API_TOKEN`).
-- Node 20+.
+| Binding | Purpose |
+| --- | --- |
+| `compatibility_flags: nodejs_compat` | Required by OpenNext and `@cloudflare/computer`. |
+| `compatibility_flags: global_fetch_strictly_public` | OpenNext caching correctness. |
+| `durable_objects` + `migrations` (`Agent`, `LeaderboardDO`, both `new_sqlite_classes`) | The per-repo archaeology agent and the global leaderboard, both SQLite-backed. |
+| `ai: { binding: "AI" }` | The one batched caption call, in-worker. |
+| `images: { binding: "IMAGES" }` | Next.js image optimization. |
+| `vars.WRAP_MODEL` | Caption model (default `@cf/meta/llama-3.2-3b-instruct`; confirm against the live catalog with `wrangler ai models`). |
+| `vars.CF_AI_GATEWAY` | AI Gateway id. Optional: if the gateway is absent the caption call retries directly. |
 
-## One-time setup
+No Worker Loader / `experimental` flag is needed (the DO uses isomorphic-git, not
+the worker-shell backend). No R2 bucket is required (OpenNext runs without the
+incremental cache; all app routes are dynamic).
 
-### 1. Generate binding types
+## The custom Worker entry
 
-```bash
-npm run cf-typegen        # -> wrangler types -> worker-configuration.d.ts
+`main` points at `src/worker/index.ts`, which re-exports OpenNext's generated
+handler plus both Durable Objects (`Agent`, `LeaderboardDO`) so wrangler can bind
+the migrated DO classes:
+
+```ts
+// @ts-ignore - generated at build time
+export { default } from "../../.open-next/worker.js";
+export { Agent } from "./agent";
+export { LeaderboardDO } from "./leaderboard";
 ```
-
-This produces the Workers runtime types (`DurableObjectNamespace`, `Ai`, …) that
-`src/worker/*.ts` and `src/worker/env.d.ts` rely on. Re-run it whenever you edit
-`wrangler.jsonc`.
-
-### 2. Create the AI Gateway
-
-The single caption call routes through AI Gateway so it is cached, rate-limited,
-and logged (PRD 6.2.1). The gateway id must match `CF_AI_GATEWAY` in
-`wrangler.jsonc` (default: `repo-wrapped`).
-
-```bash
-npx wrangler ai-gateway create repo-wrapped
-```
-
-(or create it in the dashboard under **AI → AI Gateway**). If you rename it,
-update `vars.CF_AI_GATEWAY` in `wrangler.jsonc`.
-
-### 3. Create the incremental-cache R2 bucket
-
-`wrangler.jsonc` declares an R2 bucket for OpenNext's incremental cache. Create
-it before the first deploy:
-
-```bash
-npx wrangler r2 bucket create repo-wrapped-opennext-cache
-```
-
-If you don't want caching, delete the `r2_buckets` block from `wrangler.jsonc`
-instead.
-
-### 4. Export the `Agent` DO from the Worker entry
-
-`wrangler.jsonc` binds `class_name: "Agent"` and migrates it as a
-`new_sqlite_classes` DO, so the deployed Worker bundle **must export `Agent`**.
-OpenNext generates `.open-next/worker.js` and re-exports only *its own* Durable
-Objects, not custom ones. Bridge it with one of:
-
-- **Recommended — a thin custom entry.** Add `src/worker/index.ts`:
-
-  ```ts
-  export { default } from "../../.open-next/worker.js";
-  export { Agent } from "./agent";
-  // Re-export OpenNext's DOs too if you enable its DO-backed cache/queue:
-  // export { DOQueueHandler, DOShardedTagCache, BucketCachePurge } from "../../.open-next/worker.js";
-  ```
-
-  then point `main` in `wrangler.jsonc` at `src/worker/index.ts` (wrangler will
-  bundle it). Build first so `.open-next/worker.js` exists.
-
-- **Or** append `export { Agent } from "../../src/worker/agent";` to
-  `.open-next/worker.js` as a post-build step.
-
-> This step is required because the current file set keeps `main` pointed at the
-> generated `.open-next/worker.js` per the OpenNext defaults.
-
----
-
-## Local preview
-
-```bash
-npm run preview:cf        # opennextjs-cloudflare build && wrangler dev
-```
-
-`next dev` alone also works for the UI; `next.config.ts` calls
-`initOpenNextCloudflareForDev()` so bindings resolve in the dev server. For
-captions in pure `next dev` without the AI binding, `@/lib/captions` falls back
-to the AI Gateway REST endpoint using `CF_ACCOUNT_ID` + a `CF_API_TOKEN` secret
-(otherwise it degrades to the deterministic fallback quips).
-
----
 
 ## Deploy
 
 ```bash
-npm run deploy            # opennextjs-cloudflare build && opennextjs-cloudflare deploy
+npm run cf-typegen                    # wrangler types -> worker-configuration.d.ts
+npx opennextjs-cloudflare build       # produces .open-next/worker.js
+npx wrangler deploy                   # bundles src/worker/index.ts, runs DO migrations
 ```
 
----
+`next dev` runs the whole UI locally (it uses the Node git engine: real `git`
+binary). The Workers DO path only runs in the deployed runtime.
 
-## Required flags & bindings (and why)
+## Optional
 
-| Config | Why |
-| --- | --- |
-| `compatibility_flags: nodejs_compat` | Required by both OpenNext and `@cloudflare/computer`. |
-| `compatibility_flags: experimental` | Required by the worker-shell backend (the isolate that runs `git`). |
-| `compatibility_flags: global_fetch_strictly_public` | OpenNext caching correctness. |
-| `worker_loaders: [{ binding: "LOADER" }]` | Backs the worker-shell backend — this is what makes the git archaeology run in an **isolate**, not a container. |
-| `durable_objects` + `migrations.new_sqlite_classes: ["Agent"]` | The per-repo agent; SQLite storage backs the Workspace VFS. |
-| `ai: { binding: "AI" }` | The one batched caption call, in-worker, no secret needed. |
-| `vars.WRAP_MODEL`, `vars.CF_AI_GATEWAY` | Caption model + AI Gateway id. |
+- **AI Gateway** (caching / rate limiting / logging of the caption call): create
+  a gateway named to match `CF_AI_GATEWAY` in the dashboard (AI → AI Gateway).
+  Without it, captions still come from the model via a direct call.
+- **GitHub token** (raises the fallback reader's limit from 60 to 5000 req/hr):
+  `npx wrangler secret put GITHUB_TOKEN`.
 
-## Secrets
+## Caption model note
 
-None are strictly required in production — captions use the in-worker `AI`
-binding. `CF_ACCOUNT_ID` / a `CF_API_TOKEN` secret are only for the local-dev
-REST caption fallback:
-
-```bash
-npx wrangler secret put CF_API_TOKEN
-```
-
----
-
-## Preview-package caveat
-
-`@cloudflare/computer` is a **preview** (v0.1.x). A couple of call sites in
-`src/worker/agent.ts` are marked `// TODO(preview)` — the `GitCloneOptions`
-shape and the worker-shell built-in `git` command (including `-C`). If a deploy
-surfaces a mismatch, confirm those against the installed package and adjust; the
-surrounding wiring stays the same.
+The Workers AI catalog changes over time; models get deprecated. If captions
+degrade to the deterministic fallback, run `wrangler ai models`, pick a current
+small instruct model, and set `vars.WRAP_MODEL`. The caption call uses guided
+JSON (`response_format` json_schema) and a per-key quality/safety filter, so a
+weak or unavailable model degrades gracefully to the (good) deterministic quips.

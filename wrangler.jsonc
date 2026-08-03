@@ -74,14 +74,6 @@
 			"service": "repo-wrapped"
 		}
 	],
-	// R2-backed incremental cache. Create the bucket before deploying (DEPLOY.md),
-	// or delete this block to deploy without OpenNext incremental caching.
-	"r2_buckets": [
-		{
-			"binding": "NEXT_INC_CACHE_R2_BUCKET",
-			"bucket_name": "repo-wrapped-opennext-cache"
-		}
-	],
 	// Next.js image optimization.
 	"images": {
 		"binding": "IMAGES"

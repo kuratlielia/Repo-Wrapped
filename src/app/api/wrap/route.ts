@@ -156,13 +156,15 @@ export async function POST(request: Request): Promise<Response> {
   if (cached) {
     const cachedResult: WrappedResult = { ...cached, meta: { ...cached.meta, cached: true } };
     const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
+      async start(controller) {
         const send = (event: StreamEvent) => controller.enqueue(encodeEvent(event));
         send({ type: "progress", step: "resolve", label: STEP_LABELS.resolve, status: "done" });
         send({ type: "progress", step: "read", label: STEP_LABELS.read, status: "done" });
         send({ type: "progress", step: "write", label: STEP_LABELS.write, status: "done" });
         send({ type: "result", result: cachedResult });
-        void recordWrap(cachedResult);
+        // Awaited (not fire-and-forget): on Workers the isolate can be torn down
+        // once the stream closes, which would cancel a background write.
+        await recordWrap(cachedResult);
         controller.close();
       },
     });
@@ -225,7 +227,8 @@ export async function POST(request: Request): Promise<Response> {
 
         await memoryCache.set(key, result);
         send({ type: "result", result });
-        void recordWrap(result);
+        // Awaited so the leaderboard write survives the Workers response teardown.
+        await recordWrap(result);
       } catch (err) {
         const wrapErr = asWrapError(err);
         send({

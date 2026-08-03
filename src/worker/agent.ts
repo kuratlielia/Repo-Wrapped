@@ -42,6 +42,8 @@ export interface Env {
   CF_AI_GATEWAY?: string;
   /** Overridable caption model. Defaults to a small llama in @/lib/captions. */
   WRAP_MODEL?: string;
+  /** Optional GitHub token: raises the fallback reader's rate limit (60 -> 5000/hr). */
+  GITHUB_TOKEN?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +174,9 @@ export const Agent = withWorkspace(
 
       if (!commits || commits.length === 0) {
         try {
-          const gh = await readGitHubCommits(repo, input.windowStart);
+          const gh = await readGitHubCommits(repo, input.windowStart, {
+            token: this.env.GITHUB_TOKEN,
+          });
           commits = gh.commits;
         } catch (err) {
           if (isWrapErrorLike(err)) return err;
@@ -219,11 +223,20 @@ export const Agent = withWorkspace(
       if (!ai) return undefined;
       const gatewayId = this.env.CF_AI_GATEWAY;
       return async (model, body) => {
-        const options = gatewayId
-          ? { gateway: { id: gatewayId, skipCache: false } }
-          : undefined;
-        const out = await ai.run(model, body, options);
-        return out as { response?: string } | string;
+        // Prefer routing through AI Gateway (caching / rate limiting / logging).
+        // If the gateway is not set up yet, retry the call directly so captions
+        // still come from the model rather than silently degrading to fallback.
+        if (gatewayId) {
+          try {
+            const out = await ai.run(model, body, {
+              gateway: { id: gatewayId, skipCache: false },
+            });
+            return out as { response?: string } | string;
+          } catch {
+            // Gateway not configured or unavailable; fall through to a direct call.
+          }
+        }
+        return (await ai.run(model, body)) as { response?: string } | string;
       };
     }
   },

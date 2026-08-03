@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "functions": {
+    "/api/leaderboard": {},
+    "/api/og": {},
+    "/api/wrap": {}
+  }
+}

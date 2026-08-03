@@ -7,7 +7,11 @@
 // wrangler.jsonc points here; wrangler bundles it after `opennextjs-cloudflare
 // build` has produced `.open-next/worker.js`.
 
-// @ts-expect-error - generated at build time by `opennextjs-cloudflare build`.
+// The generated worker only exists after a build, so this import cannot be
+// type-checked in a fresh checkout. `@ts-ignore` (not `@ts-expect-error`) is
+// deliberate: post-build the path resolves and an expect-error would itself error.
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore - generated at build time by `opennextjs-cloudflare build`.
 export { default } from "../../.open-next/worker.js";
 export { Agent } from "./agent";
 export { LeaderboardDO } from "./leaderboard";

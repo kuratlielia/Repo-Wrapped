@@ -1,0 +1,9 @@
+{
+  "/_global-error/page": "/_global-error",
+  "/_not-found/page": "/_not-found",
+  "/api/leaderboard/route": "/api/leaderboard",
+  "/api/og/route": "/api/og",
+  "/api/wrap/route": "/api/wrap",
+  "/icon.svg/route": "/icon.svg",
+  "/page": "/"
+}
