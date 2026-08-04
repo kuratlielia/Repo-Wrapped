@@ -21,6 +21,9 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  // Type-checking runs as its own step (tsc --noEmit), so skip the redundant
+  // in-build TypeScript pass to keep production builds fast.
+  typescript: { ignoreBuildErrors: true },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },

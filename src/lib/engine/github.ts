@@ -27,17 +27,22 @@ interface GitHubCommit {
 }
 
 const PER_PAGE = 100;
-// Concurrency for parallel page fetches. High enough to be fast, low enough to
-// be polite and to not open too many sockets at once inside the isolate.
-const CONCURRENCY = 24;
-// Absolute safety ceiling so a pathological repo cannot spin forever. 100k
-// commits in a single 12-month window is far beyond any real project.
-const PAGE_CEILING = 1000;
+// Concurrency for parallel page fetches. GitHub throttles Cloudflare's shared
+// egress IPs hard, so keep this modest.
+const CONCURRENCY = 12;
+// How many pages of real commits to pull for the distribution stats (3am club,
+// streak, busiest hour, contributors, ...). A repo with more commits than this
+// still reports its EXACT total (read from the Link header, see below); only the
+// personality stats are computed from this most-recent sample. Sized to finish
+// comfortably inside a Worker request even when GitHub is throttling.
+const SAMPLE_PAGES = 50;
 
 export interface GitHubReadResult {
   commits: RawCommit[];
-  /** True if we stopped early (rate limit / ceiling) and the count is partial. */
-  partial: boolean;
+  /** Exact total commits in the window (from the Link header), even when sampled. */
+  totalCount: number;
+  /** True when `commits` is a most-recent sample, not the full window. */
+  sampled: boolean;
 }
 
 function buildHeaders(token?: string): Record<string, string> {
@@ -58,11 +63,19 @@ function commitsUrl(repo: ParsedRepo, sinceIso: string, page: number): string {
   );
 }
 
-/** Parse the `rel="last"` page number out of a GitHub `Link` header. */
+/**
+ * Parse the `rel="last"` page number out of a GitHub `Link` header. `page` is
+ * not necessarily the final query param (GitHub appends `&since=...`), so match
+ * the page number within whichever comma-part carries rel="last".
+ */
 function lastPageFromLink(link: string | null): number | null {
   if (!link) return null;
-  const m = link.match(/[?&]page=(\d+)>;\s*rel="last"/);
-  return m ? Number(m[1]) : null;
+  for (const part of link.split(",")) {
+    if (!/rel="last"/.test(part)) continue;
+    const m = part.match(/[?&]page=(\d+)/);
+    if (m) return Number(m[1]);
+  }
+  return null;
 }
 
 function mapCommits(raw: GitHubCommit[], sinceIso: string): RawCommit[] {
@@ -144,33 +157,42 @@ export async function readGitHubCommits(
   }
   const commits: RawCommit[] = [...first.commits];
   if (first.commits.length < PER_PAGE) {
-    return { commits, partial: false };
+    // Whole window fits on page 1.
+    return { commits, totalCount: commits.length, sampled: false };
   }
 
   const last = lastPageFromLink(first.res.headers.get("link"));
-  // No Link header but a full first page: fall back to sequential discovery.
+  // No Link header but a full first page: walk sequentially (small-ish repo).
   if (last === null) {
-    return sequentialTail(repo, sinceIso, headers, commits);
+    const tail = await sequentialTail(repo, sinceIso, headers, commits);
+    return { commits: tail.commits, totalCount: tail.commits.length, sampled: tail.sampled };
   }
 
-  const target = Math.min(last, PAGE_CEILING);
-  const pageNumbers = Array.from({ length: target - 1 }, (_, i) => i + 2); // 2..target
-  let partial = last > PAGE_CEILING;
-
+  // EXACT total for the headline number, from the last page's size. Two cheap
+  // calls give us the true count even for an 80,000-commit kernel repo, so the
+  // "Total commits" stat is never capped.
+  let totalCount = last * PER_PAGE; // upper bound until we read the last page
   try {
-    const pages = await pooled(pageNumbers.length, (i) =>
-      fetchPage(repo, sinceIso, pageNumbers[i], headers)
-    );
-    for (const p of pages) commits.push(...p.commits);
-  } catch (e) {
-    if (e instanceof RateLimited) {
-      partial = true; // keep whatever pages resolved before the limit
-    } else {
-      throw e;
-    }
+    const lastPage = await fetchPage(repo, sinceIso, last, headers);
+    totalCount = (last - 1) * PER_PAGE + lastPage.commits.length;
+  } catch {
+    // Keep the estimate if the last page can't be read.
   }
 
-  return { commits, partial };
+  // Pull a bounded, most-recent sample for the distribution stats.
+  const sampleLast = Math.min(last, SAMPLE_PAGES);
+  const sampled = last > SAMPLE_PAGES;
+  const pageNumbers = Array.from({ length: sampleLast - 1 }, (_, i) => i + 2); // 2..sampleLast
+  const pages = await pooled(pageNumbers.length, async (i) => {
+    try {
+      return (await fetchPage(repo, sinceIso, pageNumbers[i], headers)).commits;
+    } catch {
+      return [] as RawCommit[];
+    }
+  });
+  for (const p of pages) commits.push(...p);
+
+  return { commits, totalCount: Math.max(totalCount, commits.length), sampled };
 }
 
 /** Fallback when GitHub omits the Link header: walk pages until one is short. */
@@ -179,22 +201,17 @@ async function sequentialTail(
   sinceIso: string,
   headers: Record<string, string>,
   commits: RawCommit[]
-): Promise<GitHubReadResult> {
-  let partial = false;
-  for (let page = 2; page <= PAGE_CEILING; page++) {
+): Promise<{ commits: RawCommit[]; sampled: boolean }> {
+  for (let page = 2; page <= SAMPLE_PAGES; page++) {
     try {
       const { commits: got } = await fetchPage(repo, sinceIso, page, headers);
       commits.push(...got);
-      if (got.length < PER_PAGE) return { commits, partial };
-    } catch (e) {
-      if (e instanceof RateLimited) {
-        partial = true;
-        break;
-      }
-      throw e;
+      if (got.length < PER_PAGE) return { commits, sampled: false };
+    } catch {
+      break;
     }
   }
-  return { commits, partial: true };
+  return { commits, sampled: true };
 }
 
 function softError(reason: WrapError["reason"], message: string): WrapError & Error {

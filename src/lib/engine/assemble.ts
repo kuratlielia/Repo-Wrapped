@@ -12,6 +12,8 @@ export interface AssembleOptions {
   engine: "node" | "workspace";
   containersUsed: number;
   cached?: boolean;
+  /** Exact total commits when `commits` is a sample (kernel-scale repos). */
+  knownTotal?: number;
   aiRun?: AiRunner;
   captionEnv?: CaptionEnv;
   generatedAt?: string;
@@ -47,6 +49,7 @@ export async function assembleFromCommits(
     windowMonths: opts.windowMonths,
     windowStart: opts.windowStart,
     windowEnd: opts.windowEnd,
+    knownTotal: opts.knownTotal,
   });
 
   const { quips, source, model } = await generateQuips(stats, {

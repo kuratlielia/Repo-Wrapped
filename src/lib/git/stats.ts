@@ -74,10 +74,17 @@ export interface StatsMeta {
   windowMonths: number;
   windowStart: string;
   windowEnd: string;
+  /** Exact total commits when `commits` is only a most-recent sample. */
+  knownTotal?: number;
 }
 
 export function computeStats(commits: RawCommit[], meta: StatsMeta): RepoStats {
-  const total = commits.length;
+  const sampleSize = commits.length;
+  // When we only have a sample (kernel-scale repos read via the GitHub API), the
+  // true total comes from the Link header. Absolute counts derived from the
+  // sample are scaled up so the story stays internally consistent with it.
+  const total = meta.knownTotal && meta.knownTotal > sampleSize ? meta.knownTotal : sampleSize;
+  const scale = sampleSize > 0 ? total / sampleSize : 1;
 
   const byAuthor = new Map<string, number>();
   const byFile = new Map<string, number>();
@@ -139,11 +146,15 @@ export function computeStats(commits: RawCommit[], meta: StatsMeta): RepoStats {
     if (count > busiestDow.count) busiestDow = { dow, count };
   });
 
-  // Top contributor by commit share.
+  // Top contributor by commit share (share is a rate within the sample).
   let topContributor: RepoStats["topContributor"] = null;
   for (const [name, c] of byAuthor) {
     if (!topContributor || c > topContributor.commits) {
-      topContributor = { name, commits: c, share: total ? c / total : 0 };
+      topContributor = {
+        name,
+        commits: Math.round(c * scale),
+        share: sampleSize ? c / sampleSize : 0,
+      };
     }
   }
 
@@ -157,8 +168,8 @@ export function computeStats(commits: RawCommit[], meta: StatsMeta): RepoStats {
     totalCommits: total,
     contributorCount: byAuthor.size,
     threeAm: {
-      count: threeAmCount,
-      percent: total ? Math.round((threeAmCount / total) * 100) : 0,
+      count: Math.round(threeAmCount * scale),
+      percent: sampleSize ? Math.round((threeAmCount / sampleSize) * 100) : 0,
     },
     longestStreak: longestStreak(dates),
     torturedFile,
@@ -167,7 +178,7 @@ export function computeStats(commits: RawCommit[], meta: StatsMeta): RepoStats {
     busiestHour: { hour: busiestHour.hour, count: Math.max(0, busiestHour.count) },
     busiestDow: { dow: busiestDow.dow, count: Math.max(0, busiestDow.count) },
     topContributor,
-    weekendShare: total ? weekendCount / total : 0,
-    nightShare: total ? nightCount / total : 0,
+    weekendShare: sampleSize ? weekendCount / sampleSize : 0,
+    nightShare: sampleSize ? nightCount / sampleSize : 0,
   };
 }

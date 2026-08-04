@@ -63,6 +63,22 @@ const GIT_IDENTITY = { name: "Repo Wrapped", email: "bot@repo-wrapped.dev" } as 
  */
 const HISTORY_DEPTH = 25000;
 
+/**
+ * Hard cap on the in-isolate clone. A giant repo (kernel-scale) would otherwise
+ * try to download its whole tree and hang; when this fires we abandon the clone
+ * and read history through the GitHub API instead, which paginates fast.
+ */
+const CLONE_TIMEOUT_MS = 20_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out`)), ms)
+    ),
+  ]);
+}
+
 // ---------------------------------------------------------------------------
 // DO input / RPC surface
 // ---------------------------------------------------------------------------
@@ -149,37 +165,52 @@ export const Agent = withWorkspace(
         cloneUrl: input.cloneUrl,
       };
 
-      // Primary path: clone + log entirely IN THE ISOLATE (the cost story). If
-      // the preview clone cannot complete, fall back to the GitHub REST reader,
-      // which is also isolate-only (a few HTTPS calls, zero containers).
+      // History acquisition, all IN THE ISOLATE, zero containers.
+      //
+      // The GitHub REST reader is the primary path: it paginates the whole
+      // window in parallel and scales to kernel-sized repos without ever trying
+      // to download a multi-gigabyte working tree. The in-isolate isomorphic-git
+      // clone is kept as a fallback for when GitHub is unavailable or rate
+      // limited (it also fills the most-tortured-file card, which the API omits).
       let commits: RawCommit[] | null = null;
+      let knownTotal: number | undefined;
+      let primaryError: unknown = null;
       try {
-        // getWorkspace(this) resolves to the LOCAL workspace this DO owns, so
-        // `ws.git` is the full isomorphic-git client (with `.clone` / `.log`).
-        using ws = await getWorkspace(this as unknown as WorkspaceHandle);
-        await ws.git.clone({
-          url: repo.cloneUrl,
-          dir: REPO_DIR,
-          singleBranch: true,
-          noTags: true,
-          depth: HISTORY_DEPTH,
+        const gh = await readGitHubCommits(repo, input.windowStart, {
+          token: this.env.GITHUB_TOKEN,
         });
-        const view = (await ws.git.log({ dir: REPO_DIR, depth: HISTORY_DEPTH })) as CommitView[];
-        commits = view
-          .map(toRawCommit)
-          .filter((c) => c.iso.slice(0, 10) >= input.windowStart);
-      } catch {
-        commits = null; // fall back below
+        commits = gh.commits;
+        // Exact total from the Link header, even when only a sample was pulled.
+        knownTotal = gh.totalCount;
+      } catch (err) {
+        // A definite not_found / private answer is authoritative; surface it.
+        if (isWrapErrorLike(err) && (err.reason === "not_found" || err.reason === "private")) {
+          return err;
+        }
+        primaryError = err;
       }
 
       if (!commits || commits.length === 0) {
         try {
-          const gh = await readGitHubCommits(repo, input.windowStart, {
-            token: this.env.GITHUB_TOKEN,
-          });
-          commits = gh.commits;
-        } catch (err) {
-          if (isWrapErrorLike(err)) return err;
+          using ws = await getWorkspace(this as unknown as WorkspaceHandle);
+          await withTimeout(
+            ws.git.clone({
+              url: repo.cloneUrl,
+              dir: REPO_DIR,
+              singleBranch: true,
+              noTags: true,
+              depth: HISTORY_DEPTH,
+            }),
+            CLONE_TIMEOUT_MS,
+            "clone"
+          );
+          const view = (await ws.git.log({ dir: REPO_DIR, depth: HISTORY_DEPTH })) as CommitView[];
+          commits = view
+            .map(toRawCommit)
+            .filter((c) => c.iso.slice(0, 10) >= input.windowStart);
+        } catch {
+          // Both paths failed. If GitHub gave a typed reason, prefer it.
+          if (isWrapErrorLike(primaryError)) return primaryError;
           return {
             ok: false,
             reason: "server",
@@ -206,6 +237,7 @@ export const Agent = withWorkspace(
         windowEnd,
         engine: "workspace",
         containersUsed: 0, // isolates only — the cost story.
+        knownTotal,
         aiRun,
         captionEnv: { WRAP_MODEL: this.env.WRAP_MODEL },
       });
